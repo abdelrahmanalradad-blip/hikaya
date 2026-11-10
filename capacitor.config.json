@@ -1,0 +1,9 @@
+{
+  "appId": "com.hikaya.app",
+  "appName": "حكايا",
+  "webDir": "dist",
+  "server": { "androidScheme": "https" },
+  "plugins": {
+    "SplashScreen": { "launchShowDuration": 1200, "backgroundColor": "#12102B", "showSpinner": false }
+  }
+}
