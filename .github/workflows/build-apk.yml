@@ -1,0 +1,112 @@
+name: Deploy API + Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------- 1) Cloudflare Worker + D1 + R2 ----------
+  deploy-api:
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.url.outputs.api_url }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+
+      - name: Create D1 database and R2 bucket (if missing)
+        run: |
+          npx wrangler d1 create hikaya-db || true
+          npx wrangler r2 bucket create hikaya-media || true
+          ID=$(npx wrangler d1 list --json | node -e "const l=JSON.parse(require('fs').readFileSync(0,'utf8'));const d=l.find(x=>x.name==='hikaya-db');if(!d){process.exit(1)}console.log(d.uuid)")
+          sed -i "s/REPLACE_DB_ID/$ID/" wrangler.toml
+
+      - name: Apply database schema
+        run: npx wrangler d1 execute hikaya-db --remote --file=schema.sql
+
+      - name: Deploy Worker
+        id: url
+        run: |
+          npx wrangler deploy 2>&1 | tee deploy.log
+          URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1)
+          if [ -n "${{ secrets.API_URL }}" ]; then URL="${{ secrets.API_URL }}"; fi
+          echo "api_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Set Worker secrets
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          FCM_SERVICE_ACCOUNT: ${{ secrets.FCM_SERVICE_ACCOUNT }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+        run: |
+          echo "$JWT_SECRET" | npx wrangler secret put JWT_SECRET
+          if [ -n "$FCM_SERVICE_ACCOUNT" ]; then echo "$FCM_SERVICE_ACCOUNT" | npx wrangler secret put FCM_SERVICE_ACCOUNT; fi
+          if [ -n "$ADMIN_EMAIL" ]; then echo "$ADMIN_EMAIL" | npx wrangler secret put ADMIN_EMAIL; fi
+
+  # ---------- 2) Android APK ----------
+  build-apk:
+    needs: deploy-api
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - run: npm install
+
+      - name: Build web app
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ needs.deploy-api.outputs.api_url }}
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Firebase config + notification permission
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then echo "$GOOGLE_SERVICES_JSON" > android/app/google-services.json; else echo "::warning::GOOGLE_SERVICES_JSON missing - push notifications disabled"; fi
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>#' android/app/src/main/AndroidManifest.xml
+
+      - name: Generate icons and splash
+        run: npx capacitor-assets generate --android
+
+      - run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - run: cp android/app/build/outputs/apk/debug/app-debug.apk Hikaya.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hikaya-APK
+          path: Hikaya.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: حكايا - إصدار ${{ github.run_number }}
+          files: Hikaya.apk
